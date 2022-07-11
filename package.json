@@ -4,7 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "nodemon --exec babel-node index.js"
+    "dev": "nodemon --exec babel-node index.js",
+    "build": "babel ./src --out-dir ./dist --source-maps",
+    "build:clean": "rm -rf dist",
+    "prebuild": "npm run build:clean",
+    "start": "npm run build && node ./dist/index.js"
   },
   "keywords": [],
   "author": "",

@@ -55,7 +55,7 @@ app.post('/message', async (req, res) => {
       return res.status(200).json({
         method: "sendMessage",
         chat_id: message.chat.id,
-        text: "Ngl bro that's kinda sus highkey lowkey"
+        text: "Ngl bro that's kinda sus lowkey highkey"
       });
     }
 

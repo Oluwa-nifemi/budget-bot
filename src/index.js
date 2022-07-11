@@ -136,7 +136,6 @@ app.post('/message', async (req, res) => {
       })
     }
 
-    //TODO: if issue ping FE that there's an issue saving
     return
   }
 

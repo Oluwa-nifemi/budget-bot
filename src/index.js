@@ -144,6 +144,6 @@ app.post('/message', async (req, res) => {
 })
 
 app.listen(PORT, () => {
-  console.log("Remember. Sapa comes like a thief in the night");
+  console.log("Remember. Sapa comes like a thief in the night which is why I'm listening for it at PORT: " + PORT);
 })
 

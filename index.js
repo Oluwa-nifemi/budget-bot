@@ -17,7 +17,38 @@ app.use(cors());
 app.use(express.json());
 
 app.post('/message', async (req, res) => {
-  const { message, callback_query } = req.body;
+  const { message, callback_query, edited_message } = req.body;
+
+  if(edited_message){
+    const [expense, amount, comment] = edited_message.text.split('\n');
+
+    const response = await notion.databases.query({
+      database_id: databaseId,
+      filter: {
+        and: [
+          {
+            property: "ID",
+            number: {
+              equals: edited_message.message_id
+            }
+          }
+        ]
+      }
+    })
+
+    if(response.results.length > 0){
+      const [result] = response.results;
+
+      const data = generateData({amount, comment, expense, id: edited_message.message_id});
+
+      await notion.pages.update({
+        page_id: result.id,
+        properties: data
+      })
+    }
+
+    return res.status(200).send()
+  }
 
   if(message){
     if(message.chat.username !== process.env.USER_ID){
@@ -36,7 +67,6 @@ app.post('/message', async (req, res) => {
       });
     }
 
-    //todo: handle help and the other one
     const [expense, amount, comment] = message.text.split('\n');
 
     const data = generateData({amount, comment, expense, id: message.message_id});

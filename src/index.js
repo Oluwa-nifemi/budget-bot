@@ -4,10 +4,18 @@ import express from 'express';
 import cors from 'cors';
 import {generateData} from "./generateData";
 import {generateOptions} from "./generateOptions";
+import {parseMessage} from "./parseMessage";
+import {HELP_TEXT, UNDO_WINDOW_MINUTES, canUndo, parseCommand} from "./commands";
+import {alertText, formatSummary, monthStart, parseBudgets, totalsByCategory} from "./budget";
+import {createStore} from "./notionStore";
+import {sendMessage} from "./telegram";
 
-const databaseId = process.env.NOTION_DATABASE_ID;
+const store = createStore({
+  notion: new Client({auth: process.env.NOTION_KEY}),
+  databaseId: process.env.NOTION_DATABASE_ID
+})
 
-const notion = new Client({auth: process.env.NOTION_KEY})
+const budgets = parseBudgets(process.env.MONTHLY_BUDGETS)
 
 const PORT = process.env.PORT || 3000;
 
@@ -16,133 +24,175 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.post('/message', async (req, res) => {
-  const { message, callback_query, edited_message } = req.body;
+const reply = (res, chatId, text, extra = {}) => res.status(200).json({
+  method: "sendMessage",
+  chat_id: chatId,
+  text,
+  ...extra
+})
 
-  if(edited_message){
-    const [expense, amount, comment] = edited_message.text.split('\n');
-
-    const response = await notion.databases.query({
-      database_id: databaseId,
-      filter: {
-        and: [
-          {
-            property: "ID",
-            number: {
-              equals: edited_message.message_id
-            }
-          }
-        ]
-      }
-    })
-
-    if(response.results.length > 0){
-      const [result] = response.results;
-
-      const data = generateData({amount, comment, expense, id: edited_message.message_id});
-
-      await notion.pages.update({
-        page_id: result.id,
-        properties: data
-      })
-    }
-
+const handleEdit = async (edited, res) => {
+  if (edited.chat.username !== process.env.USER_ID) {
     return res.status(200).send()
   }
 
-  if(message){
-    if(message.chat.username !== process.env.USER_ID){
-      return res.status(200).json({
-        method: "sendMessage",
-        chat_id: message.chat.id,
-        text: "Ngl bro that's kinda sus lowkey highkey"
-      });
-    }
+  const parsed = parseMessage(edited.text)
 
-    if(message.text === '/start'){
-      return res.status(200).json({
-        method: "sendMessage",
-        chat_id: message.chat.id,
-        text: "Hey. Time to start budgeting like a responsible (lol) adult"
-      });
-    }
-
-    const [expense, amount, comment] = message.text.split('\n');
-
-    const data = generateData({amount, comment, expense, id: message.message_id});
-
-    await notion.pages.create({
-      parent: {
-        database_id: databaseId
-      },
-      properties: data
-    });
-
-    const response = await notion.databases.retrieve({ database_id: databaseId });
-    const labelOptions = response.properties.Category.select.options;
-
-    return res.status(200).json({
-      method: "sendMessage",
-      chat_id: message.chat.id,
-      text: "Thanks",
-      reply_to_message_id: message.message_id,
-      reply_markup: {
-        inline_keyboard: generateOptions(labelOptions)
-      }
-    });
+  if (!parsed.ok) {
+    return reply(res, edited.chat.id, parsed.error)
   }
 
-  if(callback_query){
-    const { message, data } = callback_query
+  const page = await store.findByMessageId(edited.message_id)
 
-    res.status(200).json({
-      method: "editMessageText",
-      chat_id: message.chat.id,
-      message_id: message.message_id,
-      text: "Thank you <3",
-      reply_markup: {
-        inline_keyboard: []
-      }
-    });
+  if (page) {
+    await store.update(page.id, generateData({
+      amount: parsed.amount,
+      comment: parsed.comment,
+      expense: parsed.expense,
+      id: edited.message_id
+    }))
+  }
 
-    const targetMessage = message.reply_to_message.message_id;
+  return res.status(200).send()
+}
 
-    const response = await notion.databases.query({
-      database_id: databaseId,
-      filter: {
-        and: [
-          {
-            property: "ID",
-            number: {
-              equals: targetMessage
-            }
-          }
-        ]
-      }
-    })
+const handleCommand = async (command, message, res) => {
+  const chatId = message.chat.id
 
-    if(response.results.length > 0){
-      const [result] = response.results;
+  if (command === 'start') {
+    return reply(res, chatId, "Hey. Time to start budgeting like a responsible (lol) adult")
+  }
 
-      await notion.pages.update({
-        page_id: result.id,
-        properties: {
-          Category: {
-            select: {
-              id: data
-            }
-          },
-        }
-      })
+  if (command === 'summary') {
+    const totals = totalsByCategory(await store.expensesSince(monthStart()))
+
+    return reply(res, chatId, formatSummary({totals, budgets}))
+  }
+
+  if (command === 'undo') {
+    const last = await store.lastExpense()
+
+    if (!last) {
+      return reply(res, chatId, "There is nothing to undo.")
     }
 
+    if (!canUndo({createdAt: last.created_time})) {
+      return reply(res, chatId, `The last expense is older than ${UNDO_WINDOW_MINUTES} minutes, so I left it alone.`)
+    }
+
+    await store.archive(last.id)
+
+    return reply(res, chatId, "Removed your last expense.")
+  }
+
+  return reply(res, chatId, HELP_TEXT)
+}
+
+const handleMessage = async (message, res) => {
+  if (message.chat.username !== process.env.USER_ID) {
+    return reply(res, message.chat.id, "Ngl bro that's kinda sus lowkey highkey")
+  }
+
+  const command = parseCommand(message.text)
+
+  if (command) {
+    return handleCommand(command, message, res)
+  }
+
+  const parsed = parseMessage(message.text)
+
+  if (!parsed.ok) {
+    return reply(res, message.chat.id, `${parsed.error}\n\n${HELP_TEXT}`)
+  }
+
+  await store.create(generateData({
+    amount: parsed.amount,
+    comment: parsed.comment,
+    expense: parsed.expense,
+    id: message.message_id
+  }))
+
+  const labelOptions = await store.categoryOptions()
+
+  return reply(res, message.chat.id, "Thanks", {
+    reply_to_message_id: message.message_id,
+    reply_markup: {
+      inline_keyboard: generateOptions(labelOptions)
+    }
+  })
+}
+
+const warnIfOverBudget = async ({chatId, optionId}) => {
+  const options = await store.categoryOptions()
+  const category = options.find((option) => option.id === optionId)?.name
+  const limit = category && budgets[category]
+
+  if (!limit) {
     return
   }
 
-  return res.status(200).send();
+  const totals = totalsByCategory(await store.expensesSince(monthStart()))
+  const text = alertText({category, spent: totals[category] || 0, limit})
+
+  if (text) {
+    await sendMessage({token: process.env.TELEGRAM_BOT_TOKEN, chatId, text})
+  }
+}
+
+const handleCallback = async (callback, res) => {
+  const {message, data} = callback
+
+  res.status(200).json({
+    method: "editMessageText",
+    chat_id: message.chat.id,
+    message_id: message.message_id,
+    text: "Thank you <3",
+    reply_markup: {
+      inline_keyboard: []
+    }
+  });
+
+  const page = await store.findByMessageId(message.reply_to_message.message_id)
+
+  if (!page) {
+    return
+  }
+
+  await store.update(page.id, {
+    Category: {
+      select: {
+        id: data
+      }
+    }
+  })
+
+  await warnIfOverBudget({chatId: message.chat.id, optionId: data})
+}
+
+app.post('/message', async (req, res) => {
+  const { message, callback_query, edited_message } = req.body;
+
+  try {
+    if (edited_message) {
+      return await handleEdit(edited_message, res)
+    }
+
+    if (message) {
+      return await handleMessage(message, res)
+    }
+
+    if (callback_query) {
+      return await handleCallback(callback_query, res)
+    }
+  } catch (error) {
+    console.error("Could not handle the update", error)
+  }
+
+  if (!res.headersSent) {
+    res.status(200).send()
+  }
 })
 
 app.listen(PORT, () => {
   console.log("Remember. Sapa comes like a thief in the night which is why I'm listening for it at PORT: " + PORT);
 })
-
